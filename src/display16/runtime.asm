@@ -120,6 +120,12 @@ V9xMiniApiEntry  dd 0
 V9xMiniApiState  dw 0
 V9xVmHandle       dw 0
 V9xVddRegistered dw 0
+; The INT 2Fh vector the screen-switch hook displaced, and whether the hook
+; is installed (V9XHOOKSCREENSWITCH). In DGROUP, not the code segment the
+; DDK samples keep it in: the hook chains with a far return built on the
+; stack, so it needs no writable code alias.
+V9xPrevInt2F     dd 0
+V9xInt2FHooked   dw 0
 V9xHardwareStageCode dw 0
 V9xCreateDibReturn dd 0
 V9xDdSharedSel   dw 0
@@ -140,6 +146,15 @@ V9xDiagDirName db 'C:\V9XDIAG', 0
 IFDEF V9X_DURABLE_TRAIL
 ; V9xTrailWrite's file.
 V9xTrailName db 'C:\V9XDIAG\V9XTRAIL.TXT', 0
+ENDIF
+IFDEF V9X_SCREEN_SHADOW
+; The vbe screen shadow (src\display16\shadow16.c): one block of locked DPMI
+; linear memory and one LDT descriptor over it. The descriptor is kept across
+; a free and reallocation, for the reason V9xScreenSelector is.
+V9xShadowSel     dw 0
+V9xShadowLin     dd 0
+V9xShadowHandle  dd 0
+V9xShadowBytes   dd 0
 ENDIF
 
 ; GDI acceleration state that has to survive a live mode switch.
@@ -721,6 +736,289 @@ V9XDDSHAREDLINEAR PROC FAR
     mov     dx, word ptr V9xDdSharedLin+2
     retf
 V9XDDSHAREDLINEAR ENDP
+
+IFDEF V9X_SCREEN_SHADOW
+; ---------------------------------------------------------------------------
+; The vbe screen shadow's memory and its copy loop (src\display16\shadow16.c,
+; docs\plans\vbe-shadow-framebuffer.md).
+;
+; DPMI rather than the mini-VDD: the DirectDraw shared block above is the same
+; kind of memory reached the same two ways - a selector here, a linear address
+; in the HAL - and has been since the HAL existed. The block is locked (0600h)
+; because the DIB Engine draws the software cursor into it from the mouse
+; interrupt.
+
+; WORD FAR PASCAL V9xShadowAlloc(DWORD bytes): a selector over at least
+; `bytes` of locked memory, 0 on failure. The same size again returns the
+; block already held; a different one frees it first. FAR PASCAL with one
+; dword argument: bytes at [bp+6].
+PUBLIC V9XSHADOWALLOC
+V9XSHADOWALLOC PROC FAR
+    push    bp
+    mov     bp, sp
+    push    bx
+    push    cx
+    push    dx
+    push    si
+    push    di
+
+    ; Whole pages, so the limit below ends in FFFh as DPMI 0008h requires
+    ; above 1 MiB.
+    mov     eax, dword ptr [bp+6]
+    add     eax, 0FFFh
+    and     eax, 0FFFFF000h
+    jz      V9xShadowAllocFailed
+
+    cmp     dword ptr V9xShadowHandle, 0
+    je      short V9xShadowAllocNew
+    cmp     eax, dword ptr V9xShadowBytes
+    je      V9xShadowAllocReady
+    push    eax
+    call    far ptr V9XSHADOWFREE
+    pop     eax
+
+V9xShadowAllocNew:
+    mov     dword ptr V9xShadowBytes, eax
+    mov     cx, ax
+    shr     eax, 16
+    mov     bx, ax
+    mov     ax, 0501h               ; BX:CX size -> BX:CX linear, SI:DI handle
+    int     31h
+    jc      V9xShadowAllocFailed
+    mov     word ptr V9xShadowLin, cx
+    mov     word ptr V9xShadowLin+2, bx
+    mov     word ptr V9xShadowHandle, di
+    mov     word ptr V9xShadowHandle+2, si
+
+    mov     di, word ptr V9xShadowBytes
+    mov     si, word ptr V9xShadowBytes+2
+    mov     ax, 0600h               ; lock BX:CX for SI:DI bytes
+    int     31h
+    jc      short V9xShadowAllocUnwind
+
+    cmp     V9xShadowSel, 0
+    jne     short V9xShadowAllocDescribe
+    xor     ax, ax
+    mov     cx, 1
+    int     31h
+    jc      short V9xShadowAllocUnlock
+    mov     V9xShadowSel, ax
+
+V9xShadowAllocDescribe:
+    mov     bx, V9xShadowSel
+    mov     dx, word ptr V9xShadowLin
+    mov     cx, word ptr V9xShadowLin+2
+    mov     ax, 0007h
+    int     31h
+    jc      short V9xShadowAllocUnlock
+    mov     eax, dword ptr V9xShadowBytes
+    dec     eax
+    mov     dx, ax
+    shr     eax, 16
+    mov     cx, ax
+    mov     bx, V9xShadowSel
+    mov     ax, 0008h
+    int     31h
+    jc      short V9xShadowAllocUnlock
+
+V9xShadowAllocReady:
+    mov     ax, V9xShadowSel
+    jmp     short V9xShadowAllocDone
+
+V9xShadowAllocUnlock:
+    mov     bx, word ptr V9xShadowLin+2
+    mov     cx, word ptr V9xShadowLin
+    mov     si, word ptr V9xShadowBytes+2
+    mov     di, word ptr V9xShadowBytes
+    mov     ax, 0601h
+    int     31h
+V9xShadowAllocUnwind:
+    mov     si, word ptr V9xShadowHandle+2
+    mov     di, word ptr V9xShadowHandle
+    mov     ax, 0502h
+    int     31h
+    mov     dword ptr V9xShadowHandle, 0
+    mov     dword ptr V9xShadowLin, 0
+    mov     dword ptr V9xShadowBytes, 0
+V9xShadowAllocFailed:
+    xor     ax, ax
+V9xShadowAllocDone:
+    pop     di
+    pop     si
+    pop     dx
+    pop     cx
+    pop     bx
+    pop     bp
+    retf    4
+V9XSHADOWALLOC ENDP
+
+; void FAR PASCAL V9xShadowFree(void): unlock and free the block. The
+; descriptor is kept, described as one byte at linear 0, so nothing reaching
+; it afterwards lands in memory DPMI has handed to someone else.
+PUBLIC V9XSHADOWFREE
+V9XSHADOWFREE PROC FAR
+    push    ax
+    push    bx
+    push    cx
+    push    dx
+    push    si
+    push    di
+
+    cmp     dword ptr V9xShadowHandle, 0
+    je      short V9xShadowFreeDone
+
+    mov     bx, word ptr V9xShadowLin+2
+    mov     cx, word ptr V9xShadowLin
+    mov     si, word ptr V9xShadowBytes+2
+    mov     di, word ptr V9xShadowBytes
+    mov     ax, 0601h
+    int     31h
+    mov     si, word ptr V9xShadowHandle+2
+    mov     di, word ptr V9xShadowHandle
+    mov     ax, 0502h
+    int     31h
+    mov     dword ptr V9xShadowHandle, 0
+    mov     dword ptr V9xShadowLin, 0
+    mov     dword ptr V9xShadowBytes, 0
+
+    mov     bx, V9xShadowSel
+    or      bx, bx
+    jz      short V9xShadowFreeDone
+    xor     cx, cx
+    xor     dx, dx
+    mov     ax, 0007h
+    int     31h
+    mov     bx, V9xShadowSel
+    xor     cx, cx
+    xor     dx, dx
+    mov     ax, 0008h
+    int     31h
+
+V9xShadowFreeDone:
+    pop     di
+    pop     si
+    pop     dx
+    pop     cx
+    pop     bx
+    pop     ax
+    retf
+V9XSHADOWFREE ENDP
+
+; DWORD FAR PASCAL V9xShadowLinear(void): the block's linear address in
+; DX:AX, 0 when none is held. The HAL's half of option B reaches it there.
+PUBLIC V9XSHADOWLINEAR
+V9XSHADOWLINEAR PROC FAR
+    mov     ax, word ptr V9xShadowLin
+    mov     dx, word ptr V9xShadowLin+2
+    retf
+V9XSHADOWLINEAR ENDP
+
+; void FAR PASCAL V9xShadowFlush(DWORD offset, WORD row_bytes, WORD rows,
+;                                DWORD pitch)
+;
+; Copy `rows` rows of `row_bytes` from the shadow to the frame buffer, both at
+; `offset` and stepping by `pitch`. Pascal pushes left to right: pitch at
+; [bp+6], rows [bp+10], row_bytes [bp+12], offset [bp+14].
+;
+; Runs from the mouse interrupt (the cursor flushes), so it touches the two
+; selectors and nothing else, and saves every 32-bit register it uses: the
+; DIB Engine keeps values in the high halves across its calls into the driver.
+;
+; The 67h prefixes make the string moves use ESI/EDI, because both blocks are
+; larger than 64 KiB. Each iteration of a rep move completes before an
+; interrupt is taken, so a cursor flush that interrupts this one never has
+; its newer pixels overwritten with older ones.
+PUBLIC V9XSHADOWFLUSH
+V9XSHADOWFLUSH PROC FAR
+    push    bp
+    mov     bp, sp
+    push    ds
+    push    es
+    push    eax
+    push    ebx
+    push    ecx
+    push    edx
+    push    esi
+    push    edi
+
+    mov     ax, DGROUP
+    mov     ds, ax
+    mov     bx, V9xShadowSel
+    mov     dx, V9xScreenSelector
+    or      bx, bx
+    jz      short V9xShadowFlushDone
+    or      dx, dx
+    jz      short V9xShadowFlushDone
+    cmp     dword ptr V9xShadowHandle, 0
+    je      short V9xShadowFlushDone
+    mov     es, dx
+    mov     ds, bx
+
+    mov     ebx, dword ptr [bp+14]
+    movzx   edx, word ptr [bp+12]
+    mov     ax, word ptr [bp+10]
+    cld
+V9xShadowFlushRow:
+    or      ax, ax
+    jz      short V9xShadowFlushDone
+    mov     esi, ebx
+    mov     edi, ebx
+    mov     ecx, edx
+    shr     ecx, 2
+    db      67h
+    rep     movsd
+    mov     ecx, edx
+    and     ecx, 3
+    db      67h
+    rep     movsb
+    add     ebx, dword ptr [bp+6]
+    dec     ax
+    jmp     short V9xShadowFlushRow
+
+V9xShadowFlushDone:
+    pop     edi
+    pop     esi
+    pop     edx
+    pop     ecx
+    pop     ebx
+    pop     eax
+    pop     es
+    pop     ds
+    pop     bp
+    retf    12
+V9XSHADOWFLUSH ENDP
+
+; void FAR PASCAL V9xShadowZero(void): clear the whole block, so the shadow
+; and a frame buffer cleared by the mode set start out agreeing.
+PUBLIC V9XSHADOWZERO
+V9XSHADOWZERO PROC FAR
+    push    es
+    push    eax
+    push    ecx
+    push    edi
+
+    mov     ax, V9xShadowSel
+    or      ax, ax
+    jz      short V9xShadowZeroDone
+    cmp     dword ptr V9xShadowHandle, 0
+    je      short V9xShadowZeroDone
+    mov     es, ax
+    mov     ecx, dword ptr V9xShadowBytes
+    shr     ecx, 2
+    xor     eax, eax
+    xor     edi, edi
+    cld
+    db      67h
+    rep     stosd
+
+V9xShadowZeroDone:
+    pop     edi
+    pop     ecx
+    pop     eax
+    pop     es
+    retf
+V9XSHADOWZERO ENDP
+ENDIF
 
 ; The rectangle form of the same DIBENG routine, re-exported so C code can call
 ; it with the full argument list. It gets the same dirty check as the plain
@@ -2449,6 +2747,18 @@ V9xVddRegisterDone:
     retf
 V9XVDDREGISTER ENDP
 
+; From here to SSWCODE ENDS: the VDD calls that make no near call (the
+; re-registration, post-mode-change and unregister) and the screen-switch
+; hook with its helpers, in SSWCODE with sswitch16.c, to keep _TEXT under
+; budget (docs\decisions\2026-11-10-dos-box-return-screen-switch-hook.md).
+; V9XVDDREGISTER stays in _TEXT: it calls two near helpers. Every entry
+; here is FAR, so callers in _TEXT reach them by far calls. The class name
+; must end in CODE or wlink links the segment as DATA; it matches the -nc=
+; that sswitch16.c is compiled with, so the two contributions combine into
+; one NE segment.
+SSWCODE SEGMENT WORD PUBLIC 'SSWCODE'
+    ASSUME CS:SSWCODE
+
 ; Re-issue VDD_DRIVER_REGISTER with the new visible-byte count during a live
 ; mode switch. The VDD accepts a repeated registration and updates its
 ; save/restore state; I/O trapping stays stopped because the driver never
@@ -2529,6 +2839,130 @@ V9xVddUnregisterDone:
     pop     bx
     retf
 V9XVDDUNREGISTER ENDP
+
+; VDD_SAVE_DRIVER_STATE alone, for ResetHiResMode: the DDK's framebuffer
+; ResetHiResMode asks the VDD to save the restored register state, and
+; sends no POST_MODE_CHANGE (98DDK\src\display\mini\framebuf\VGA.ASM).
+PUBLIC V9XVDDSAVESTATE
+V9XVDDSAVESTATE PROC FAR
+    push    bx
+    cmp     V9xVddRegistered, 0
+    je      short V9xVddSaveStateDone
+    mov     eax, VDD_SAVE_DRIVER_STATE
+    movzx   ebx, V9xVmHandle
+    call    dword ptr V9xVddEntryPoint
+V9xVddSaveStateDone:
+    pop     bx
+    retf
+V9XVDDSAVESTATE ENDP
+
+; The screen-switch notifications every DDK display sample hooks
+; (98DDK\src\display\mini\framebuf\SSWITCH.ASM): INT 2Fh AX=4001h when a
+; full-screen DOS box takes the display, 4002h when Windows gets it back.
+; The driver marks its PDEVICE busy on the first, so the DIB Engine stops
+; drawing to a screen it does not own, and repaints on the second. Without
+; them a full-screen round trip left the desktop frozen and unrepainted
+; (Win86SE boot 680, 2026-11-10).
+SCREEN_SWITCH_OUT EQU 4001h
+SCREEN_SWITCH_IN  EQU 4002h
+EXTRN V9XSCREENSWITCH:FAR
+
+V9xScreenSwitchHook PROC FAR
+    cmp     ax, SCREEN_SWITCH_IN
+    je      short V9xScreenSwitchHandle
+    cmp     ax, SCREEN_SWITCH_OUT
+    je      short V9xScreenSwitchHandle
+
+    ; Not ours: chain to the previous handler by building its address as a
+    ; far return over the caller's interrupt frame, which stays intact.
+    sub     sp, 4
+    push    bp
+    mov     bp, sp
+    push    ds
+    push    ax
+    mov     ax, DGROUP
+    mov     ds, ax
+    mov     ax, word ptr V9xPrevInt2F
+    mov     [bp+2], ax
+    mov     ax, word ptr V9xPrevInt2F+2
+    mov     [bp+4], ax
+    pop     ax
+    pop     ds
+    pop     bp
+    retf
+
+V9xScreenSwitchHandle:
+    ; Handled here and not passed on, as the samples do. Carry clear in the
+    ; returned flags says the switch may proceed.
+    push    bp
+    mov     bp, sp
+    push    ds
+    push    es
+    pushad
+    mov     bx, DGROUP
+    mov     ds, bx
+    push    ax
+    call    V9XSCREENSWITCH
+    popad
+    pop     es
+    pop     ds
+    and     word ptr [bp+6], NOT 1
+    pop     bp
+    iret
+V9xScreenSwitchHook ENDP
+
+; Install the hook once; later Enables find it installed. DS is DGROUP.
+PUBLIC V9XHOOKSCREENSWITCH
+V9XHOOKSCREENSWITCH PROC FAR
+    push    bx
+    push    dx
+    push    ds
+    push    es
+    cmp     V9xInt2FHooked, 0
+    jne     short V9xHookScreenSwitchDone
+    cli
+    mov     ax, 352Fh
+    int     21h
+    mov     word ptr V9xPrevInt2F, bx
+    mov     word ptr V9xPrevInt2F+2, es
+    mov     V9xInt2FHooked, 1
+    mov     dx, OFFSET V9xScreenSwitchHook
+    mov     ax, SEG V9xScreenSwitchHook
+    mov     ds, ax
+    mov     ax, 252Fh
+    int     21h
+    sti
+V9xHookScreenSwitchDone:
+    pop     es
+    pop     ds
+    pop     dx
+    pop     bx
+    retf
+V9XHOOKSCREENSWITCH ENDP
+
+; Put the displaced vector back. Like the samples, this assumes nobody
+; hooked INT 2Fh after the driver did.
+PUBLIC V9XUNHOOKSCREENSWITCH
+V9XUNHOOKSCREENSWITCH PROC FAR
+    push    dx
+    push    ds
+    cmp     V9xInt2FHooked, 0
+    je      short V9xUnhookScreenSwitchDone
+    cli
+    mov     V9xInt2FHooked, 0
+    lds     dx, V9xPrevInt2F
+    mov     ax, 252Fh
+    int     21h
+    sti
+V9xUnhookScreenSwitchDone:
+    pop     ds
+    pop     dx
+    retf
+V9XUNHOOKSCREENSWITCH ENDP
+
+SSWCODE ENDS
+
+.code
 
 V9xFindPciDevice PROC NEAR
     push    di

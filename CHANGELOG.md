@@ -4,6 +4,50 @@ All notable Velocity9x changes are recorded here. The project uses semantic
 version numbers for product milestones; diagnostic builds retain a separate
 build identifier so exact guest-tested binaries remain traceable.
 
+## 0.46.0 - 2026-11-11
+
+- **`vbe` package: moving windows, scrolling, and anything else that
+  reads the screen is many times faster.** Windows now draws the
+  desktop into a copy in system memory, and the driver copies each change
+  to the screen. Since 0.39.0 the screen has been fast to write and stays
+  slow to read: about 150 MB/s on an Intel HD 4600, 5 to 6 MB/s on the
+  AMD cards measured. On the HD 4600, a 256x256 window move went from 103
+  to 2,124 MB/s, an overlapping copy (what scrolling does) from 24 to
+  2,665 MB/s, and ScrollDC from 153 to 6,957 MB/s; small areas gain
+  less (2.5 times at 8x8). On a Radeon R3E, reads went from 5 MB/s to
+  350-1,180 MB/s at 8, 16 and 32 bpp, and scrolling an 800x600 window
+  from 400 ms to 2-3 ms. Scrolling up a document is no longer seven
+  times slower than scrolling down (HD 4600). The cost is the extra
+  copy: drawing that only writes runs at 0.3 to 0.8 of its old speed,
+  text costs 1.3 to 1.9 times as much and lines 1.35 to 3.4 times. After a
+  full-screen DOS box the desktop is back at once. A file
+  `C:\V9XDIAG\NOSHADOW.TXT` turns it off
+  ([record](docs/decisions/2026-11-11-vbe-screen-shadow-phase1.md)).
+- **Known issue, `vbe` package: software OpenGL in a window presents
+  slowly.** The back buffer is kept in video memory, so each present
+  reads the screen's memory: about 70 ms a frame for a small window on a
+  Radeon R3E, 1.5 s at 800x600 on one GTX 970 (GitHub issue 25). Not
+  fixed in this release
+  ([issue](docs/issues/2026-11-11-vbe-soft-gl-back-buffer-in-video-memory.md)).
+
+## 0.45.0 - 2026-11-10
+
+- **Withdrawn known issue, every card: a program that crashes or is
+  killed while it has DirectDraw surfaces no longer crashes the next
+  DirectDraw or Direct3D program.** The fix shipped in 0.30.0 and was
+  never announced; since then the README and this changelog's 0.29.0
+  entry told users to restart Windows after such a crash, which is not
+  needed ([issue](docs/issues/2026-10-25-next-program-crashes-after-one-dies-holding-surfaces.md)).
+- **Every card: leaving a full-screen DOS box repaints the desktop.**
+  The driver now follows the screen-switch protocol of the Windows 98
+  DDK's display samples: it stops drawing while DOS has the screen, and
+  asks Windows to repaint every window when the screen comes back.
+  Before, the desktop came back frozen and unrepainted. Measured on an
+  emulated S3 ViRGE/DX (86Box), an Intel HD 4600 and an Intel GMA 950,
+  where the return used to hang the machine. Text typed in a full-screen
+  DOS box also no longer lands at the top-left corner
+  ([record](docs/decisions/2026-11-10-dos-box-return-screen-switch-hook.md)).
+
 ## 0.44.0 - 2026-11-08
 
 - **`intel-gma` package, GMA X3100, 4500, X4500, 4500MHD and Ironlake HD

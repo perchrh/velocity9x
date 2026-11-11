@@ -1,5 +1,10 @@
 # A program that dies holding surfaces crashes the next DirectDraw program
 
+Status, 2026-11-10: fixed. The fix below was committed as `5dcbdb32` the
+same day and has shipped since 0.30.0; T14 has passed on committed builds
+on the netbook and A8U4I5 since. The status line that follows is the
+original and went stale. See "2026-11-10: status check and an 86Box run".
+
 Date: 2026-10-25. Reported by Michael on the Rage 128 ("switch between
 3d programs ... the program either crashes or has graphical issues,
 reboot fixes it"); reproduced by V9XD32 T14 on the GMA 950 netbook and
@@ -204,3 +209,134 @@ Not done: the `/t14*` control variants with the fix, and ATI's driver. Why ATI's
 above predicts that any driver whose `GUID_D3DExtendedCaps` answer does
 not depend on the calling process does, and makes the earlier guess
 (ATI places surfaces itself) unnecessary.
+
+## 2026-11-10: status check and an 86Box run
+
+The README still listed this as a known issue on every card, and
+docs/STATUS.md and the issue index repeated this record's opening line
+("not yet committed"). Git says otherwise:
+
+- `5dcbdb32` (2026-10-25) is the fix described above. It is on main and
+  in every tag from v0.30.0. `src/display32/d3d/d3d_core.c` still decides
+  the level per object (`v9x_d3d_object_ddi6`, `v9x_d3d_ddi_for_object`);
+  the DDI 8 work extended it (`v9x_d3d_get_driver_info2` latches DDI 8 the
+  same way) and did not undo it.
+- The 0.30.0 changelog does not mention the fix; the 0.29.0 known-issue
+  entry was never withdrawn.
+- T14 on committed builds: netbook, 0.30.0 checks, `/ddi6` and `/ddi5`
+  PASS with the default child
+  ([record](../decisions/2026-10-26-0.30.0-release-checks.md)); A8U4I5,
+  0.32.0 checks, PASS at `/ddi6` and `/ddi5`, and the `-t14nomode` in the
+  report names did nothing, so the default child ran
+  ([record](../decisions/2026-10-27-0.32.0-release-checks-ati-ironlake.md)).
+  Since then V9XD32, T14 included, is in every release check. That is the
+  exit criterion docs/STATUS.md set for this row.
+
+Then an attempt to reproduce it on the 86Box ViRGE/DX guest (Win86SE,
+`virge_dx_pci`, Win98 SE, port 9869, agent updated 0.9.1 to 0.16.0 first),
+`s3` family, 1024x768x16 desktop, V9XD32 `/bpp16 /ddi6`. Reports in
+[`../probe/86box-virge-dead-program-2026-11-10/`](../probe/86box-virge-dead-program-2026-11-10/).
+
+| Boot | Driver set | Probe | Dying program | Next program |
+|---|---|---|---|---|
+| 674 | the guest's own, an 0.15.x-era set | `852e8a1d` | T14 child | T14 PASS, but `RunDdi=unknown`: the probe could not read that HAL's counters, so the DDI level is unknown. Not counted. |
+| 675 | `6bcfac9a` (the fix's parent), WININIT rename, hashes checked | `6bcfac9a` | T14 child, mid-scene, `ExitProcess` | opens DirectDraw, flip chain, device, draws, reads back. `RunDdi=6`, 248 DrawPrimitives2 calls |
+| 675 | same | same | V9XD32 killed with the agent's `kill` (`TerminateProcess`) at T13, exclusive flip chain and device held | runs to the end; every result line equals the undisturbed run's |
+| 676 | `852e8a1d` (main) | `852e8a1d` | T14 child | T14 PASS (`DITHERED`), `RunDdi=6`, 259 DrawPrimitives2 calls |
+| 676 | same | same | killed at T13, as above | runs to the end; every result line equals the undisturbed run's |
+
+The `6bcfac9a` probe reports T14 `FAIL` with 374 mismatches. That is T1's
+count, the ViRGE's 16-bit ordered dither, which that probe did not yet
+classify (`DITHERED` came on 2026-11-05,
+[record](../decisions/2026-11-04-virge-dx-silicon-3d-and-mip-filter-swap.md));
+the next program did not die. Main's two failures on this guest are T20
+(`T20Ok=0x8A0`) and T21 (`T21Ok=0x8`), not looked into here.
+
+So on this guest the defect does not reproduce even without the fix: a
+DDI 6 program that dies, by `ExitProcess` or by `TerminateProcess`, does
+not break the next one. The guest runs DirectX 6.1 (DDRAW.DLL
+4.06.03.0518; `HKLM\Software\Microsoft\DirectX` `Version`), not the
+4.07.00.0700 DDRAW.DLL read above; the netbook has DirectX 7 and A8U4I5
+DirectX 8 or later. The likely difference is that DirectX 6.1's reset
+does not re-ask `GUID_D3DExtendedCaps` or does not refuse the short
+answer; that was not read from its DDRAW.DLL, so it is a guess. The 86Box
+guest is therefore not a regression test for this defect as it stands. A
+DirectX 8.0 redistributable is on the host (`DX80ENG.EXE`); installing it
+on the guest would change the VM for good and was not done.
+
+Win86SE was left on main's set (`852e8a1d`), boot 676, with V9XD32 at
+`C:\V9XD32.EXE`. Its previous set is saved outside the tree in the session
+notes.
+
+### The same guest with DirectX 8.0 (2026-11-10, later)
+
+Michael asked for DirectX 8.0 on the guest. Cold profile backup first
+(`86Box VMs\Velocity9x Backups\Win86SE-pre-velocity9x-20261110-172157`,
+DirectX 6.1, main's set), then `DX80ENG.EXE /Q /T:C:\DX8\EX /C` and
+`DXSETUP /silent` (exit 1, its own WININIT with `NUL=` lines, which went
+through on an agent `reboot`). Boot 678: DirectX `Version` 4.08.00.0400,
+DDRAW.DLL 344,064 bytes (299,008 before), D3D8.DLL present, and V9XD32's
+T16 (DirectX 7) now runs and passes. Same switches as above; files with
+the `dx8-` prefix in the same folder.
+
+| Boot | Driver set and probe | Dying program | Next program |
+|---|---|---|---|
+| 678 | `852e8a1d` (main) | T14 child | T14 PASS, `RunDdi=6`, 264 DrawPrimitives2 calls; `Failures=2`, T20 and T21 as before |
+| 678 | same | killed (`TerminateProcess`) at T13 | runs to the end; result lines equal the undisturbed run's |
+| 679 | `6bcfac9a` (pre-fix), hashes checked | T14 child | creates surfaces and device, draws, reads back; T14 `FAIL` is the 374 dithered pixels again (`Failures=0xA`: 7 culling, 3 dither, as that probe judged the ViRGE) |
+| 679 | same | V9XD32 `/child /ddi6` run alone, then a V9XTRACE snapshot | the next V9XD32 runs to T13 normally (killed there by design) |
+| 679 | same | killed at T13 | runs to the end; result lines equal the undisturbed run's |
+
+The snapshot after the lone child (`dx8-prefix-child-V9XSNAP.INI`, ring
+entries 429-445) holds the sequence this record describes from the
+netbook: `FlipToGDISurface`, `DestroySurface`, `D3dContextDestroyAll`,
+`Dd16CreateObject` with reset, one `GetDriverInfo` for `7DE41F80`
+(`GUID_D3DExtendedCaps`), `SetExclusiveMode(0)`, `Dd16DestroyDriver`. So
+the reset and the re-asked caps happen under DirectX 8.0 too. The ring
+does not record the answer's size or whether DDRAW refused it; the trace
+pushes that showed that on the netbook are not in the tree.
+
+So the 86Box ViRGE guest does not reproduce the defect with DirectX 6.1
+or 8.0, before or after the fix. It reproduced on the netbook (DirectX 7,
+DDRAW 4.07.00.0700) and A8U4I5. Not established: whether DirectX 8.0's
+DDRAW accepts the short answer, or something on this guest keeps the
+reset from failing; telling them apart needs DX8's DDRAW.DLL read the
+way DX7's was above, or the size pushes back in a scratch HAL. The fix
+is not in question: it removes the per-process difference either way.
+
+Win86SE left on main's set (`852e8a1d`), DirectX 8.0, boot 680, V9XD32
+from main at `C:\V9XD32.EXE`.
+
+### Haswell 4570, real hardware (2026-11-10, later)
+
+W9QI5A83 (i5-4570, HD 4600, intel-gma), Windows 98 SE with DirectX
+9.0c (4.09.00.0904), agent 0.13.1, boots 197-198. HAL built from
+`24ecd14e` (0.44.0, so with the fix); V9XD32 from main (`852e8a1d`,
+`/bpp16 /ddi6`) as `C:\V9XD32M.EXE`. No pre-fix build was run here.
+Files with the `hsw-` prefix in the same folder.
+
+| Boot | Dying program | Next program |
+|---|---|---|
+| 197 | T14 child (undisturbed run) | `Result=PASS`, `Failures=0`, `RunDdi=6` (read live; the saved copy was cut by the agent's bounded `cat` and is not kept) |
+| 197 | V9XD32 killed twice through the agent | `Result=PASS` both times; neither kill held surfaces (below) |
+| 197 | 3DMark 2000 default benchmark, killed 45 s in (fullscreen 1024x768) | never started: see below |
+| 198 | the same, killed 45 s in | V9XD32 `Result=PASS`, `Failures=0` |
+| 198 | the same again, with the boot 197 calls after the kill | V9XD32 `Result=PASS`, `Failures=0` |
+
+V9XD32 runs end to end in under 4 s on this machine and each agent call
+over its wifi takes most of a second, so both V9XD32 kills landed at
+`12-t14-child`, after the parent had released its own surfaces. They
+show only that a parent killed while waiting on its child does no harm.
+The 3DMark kills are the real test: a DirectX 7 program holding an
+exclusive flip chain and a device at DDI 7.
+
+At boot 197 the first 3DMark kill succeeded, and a window list 4 s
+later showed the 800x600 desktop back with 3DMark gone. The next call,
+a screenshot, timed out, and the machine then answered neither ping
+nor the agent for over 6 minutes, until Michael power-cycled it. What
+the screen showed then was not recorded. Boot 198 left nothing about
+it in V9XDDT.TXT, V9XD7.LOG or BOOTLOG.TXT. Two repeats at boot 198,
+the second with the same calls in the same order, did not reproduce
+it. Whether boot 197 was a machine hang or the wifi key dropping is
+not established; the wifi utility on this box has stolen focus and
+dropped transfers before.
